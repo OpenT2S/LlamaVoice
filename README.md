@@ -7,8 +7,7 @@ LlamaVoice is an innovative, Llama-based model for large-scale voice generation.
 The following diagram illustrates the architecture of LlamaVoice:
 
 ```mermaid
-flowchart LR
-
+graph TD
     text([Text]) --> bbpe(Tokenizer)
     bbpe --> model(Llama)
     Voice_prompt([Prompt Voice]) --> speech_encoder(Voice Encoder) --> model
