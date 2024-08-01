@@ -1,0 +1,1 @@
+from .hifigan import HiFiGANGenerator
