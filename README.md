@@ -21,7 +21,7 @@ graph TD
 ## Key Features
 
 - **Continuous Feature Prediction**: LlamaVoice predicts continuous features directly, bypassing the need for vector quantization and resulting in a more efficient process.
-- **VAE Latent Feature Prediction**: Unlike [models](https://arxiv.org/pdf/2407.0855) that predict mel-spectrograms, LlamaVoice predicts Variational Autoencoder (VAE) latent features, enabling more flexible and expressive voice generation.
+- **VAE Latent Feature Prediction**: Unlike [models](https://arxiv.org/pdf/2407.08551) that predict mel-spectrograms, LlamaVoice predicts Variational Autoencoder (VAE) latent features, enabling more flexible and expressive voice generation.
 - **Joint Training**: The VAE and Large Language Model (LLM) are trained together, simplifying the training procedure and enhancing overall performance.
 - **Advanced Sampling Strategy**: LlamaVoice implements a novel sampling strategy on the predicted distribution, resulting in more diverse latent representations.
 - **Flow-based Enhancement**: Utilizes flow-based models to make the latent space more amenable to prediction by the LLM, improving the quality and consistency of generated voices.
