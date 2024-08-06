@@ -1,1 +1,2 @@
 from .hifigan import HiFiGANGenerator
+from .hifigan import HiFiGANMultiScaleMultiPeriodDiscriminator

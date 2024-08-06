@@ -7,6 +7,49 @@ from typing import Dict
 
 import numpy as np
 import torch
+from torch.nn.utils.rnn import pad_sequence, unpad_sequence
+
+
+def pad_unpad_sequence(
+    text_embed, text_token_len, feats, feats_len, target, target_len, IGNORE_ID=-1
+):
+    print("---input shape", text_embed.shape, feats.shape, target.shape)
+    print("--- input length", text_token_len, feats_len, target_len)
+    text_embed = unpad_sequence(text_embed, text_token_len.cpu(), batch_first=True)
+    feats = unpad_sequence(feats, feats_len.cpu(), batch_first=True)
+    target = unpad_sequence(target, target_len.cpu(), batch_first=True)
+    lm_input = [
+        torch.concat([text_embed[i], feats[i], target[i]], dim=0)
+        for i in range(len(text_embed))
+    ]
+    lm_input_len = torch.tensor([i.size(0) for i in lm_input], dtype=torch.int32)
+    lm_input = pad_sequence(lm_input, batch_first=True, padding_value=IGNORE_ID)
+    return lm_input, lm_input_len
+
+
+def split_hidden_states(
+    last_hidden_state, text_token_len, prompt_feats_len, target_feats_len, IGNORE_ID=-1
+):
+    batch_size = last_hidden_state.size(0)
+    text_logits = unpad_sequence(
+        last_hidden_state, text_token_len.cpu(), batch_first=True
+    )
+    text_logits = pad_sequence(text_logits, batch_first=True, padding_value=IGNORE_ID)
+
+    prompt_logits = [
+        last_hidden_state[i].narrow(0, text_token_len[i], prompt_feats_len[i])
+        for i in range(batch_size)
+    ]
+    prompt_logits = pad_sequence(
+        prompt_logits, batch_first=True, padding_value=IGNORE_ID
+    )
+    dist_logits = [
+        last_hidden_state[i, text_token_len[i] + prompt_feats_len[i] :, :]
+        for i in range(batch_size)
+    ]
+    dist_logits = pad_sequence(dist_logits, batch_first=True, padding_value=IGNORE_ID)
+    dist_logits = dist_logits[:, : target_feats_len.max(), :]
+    return text_logits, prompt_logits, dist_logits
 
 
 def to_device(m, x):

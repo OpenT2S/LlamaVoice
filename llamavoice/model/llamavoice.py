@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import asdict
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -9,11 +10,22 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils import is_flash_attn_2_available
+from transformers.modeling_outputs import ModelOutput
 
 from llamavoice.config import Config as DefultConfig
 from llamavoice.encoder import PosteriorEncoder
 from llamavoice.flow import ResidualAffineCouplingBlock
-from llamavoice.decoder import HiFiGANGenerator
+from llamavoice.decoder import (
+    HiFiGANGenerator,
+    HiFiGANMultiScaleMultiPeriodDiscriminator,
+)
+from llamavoice.utils import (
+    pad_unpad_sequence,
+    split_hidden_states,
+    get_random_segments,
+    get_segments,
+)
+from llamavoice.model import LamaVoiceLoss
 
 
 class LlamaVoiceConfig(PretrainedConfig):
@@ -28,6 +40,12 @@ class LlamaVoiceConfig(PretrainedConfig):
         )
         self.flow_config = kwargs.get("flow_config", asdict(DefultConfig.flow))
         self.decoder_config = kwargs.get("decoder_config", asdict(DefultConfig.decoder))
+        self.discriminator_config = kwargs.get(
+            "discriminator_config", asdict(DefultConfig.discriminator)
+        )
+        self.train = PretrainedConfig(**kwargs.get("train", asdict(DefultConfig.train)))
+        self.loss_config = kwargs.get("loss_config", asdict(DefultConfig.loss))
+        self.stop_threshold = kwargs.get("stop_threshold", 0.5)
         super().__init__(**kwargs)
 
 
@@ -37,14 +55,22 @@ class LlamaVoice(PreTrainedModel):
         self.use_flash_attn = config.use_flash_attn
 
         self.gpt, self.llama_config = self._build_llama(config.gpt_config)
-        model_dim = int(self.gpt.config.hidden_size)
+        self.model_dim = int(self.gpt.config.hidden_size)
 
-        self.text_embedding = torch.nn.Embedding(config.num_text_tokens, model_dim)
+        self.text_embedding = torch.nn.Embedding(config.num_text_tokens, self.model_dim)
         self.posterior_encoder = self._build_posterior_encoder(
             config.audio_encoder_config
         )
+        self.text_head = nn.Linear(self.model_dim, config.num_text_tokens)
+        self.dist_head = nn.Linear(self.model_dim, 2 * self.model_dim)
+        self.stop_proj = nn.Linear(self.model_dim, 1)
+
         self.flow = self._build_flow(config.flow_config)
         self.decoder = self._build_decoder(config.decoder_config)
+        self.discriminator = self._build_discriminator(config.discriminator_config)
+        # Loss criterion
+        self.criterion = LamaVoiceLoss(config.loss_config)
+        self.config = config
 
     def _build_llama(
         self,
@@ -71,7 +97,7 @@ class LlamaVoice(PreTrainedModel):
         config = PretrainedConfig(**config)
         return PosteriorEncoder(
             in_channels=config.aux_channels,
-            out_channels=config.hidden_channels,
+            out_channels=self.model_dim,
             hidden_channels=config.hidden_channels,
             kernel_size=config.posterior_encoder_kernel_size,
             layers=config.posterior_encoder_layers,
@@ -84,8 +110,8 @@ class LlamaVoice(PreTrainedModel):
 
     def _build_flow(self, config: dict):
         config = PretrainedConfig(**config)
-        return ResidualAffineCouplingBlock(
-            in_channels=config.hidden_channels,
+        return ResidualAffineCouplingBlock(  # FIXME: Causal version
+            in_channels=self.model_dim,
             hidden_channels=config.hidden_channels,
             flows=config.flow_flows,
             kernel_size=config.flow_kernel_size,
@@ -99,8 +125,9 @@ class LlamaVoice(PreTrainedModel):
 
     def _build_decoder(self, config: dict):
         config = PretrainedConfig(**config)
+        self.upsample_factor = int(np.prod(config.decoder_upsample_scales))
         return HiFiGANGenerator(
-            in_channels=config.hidden_channels,
+            in_channels=self.model_dim,
             out_channels=1,
             channels=config.decoder_channels,
             global_channels=config.global_channels,
@@ -112,45 +139,135 @@ class LlamaVoice(PreTrainedModel):
             use_weight_norm=config.use_weight_norm_in_decoder,
         )
 
+    def _build_discriminator(self, config: dict):
+        return HiFiGANMultiScaleMultiPeriodDiscriminator(**config)
+
+    def dist_sampling(self, x):
+        stats = self.dist_head(x)  # (b, t, c)
+        m, logs = stats.split(stats.size(2) // 2, dim=2)
+        z = m + torch.randn_like(m) * torch.exp(logs)
+        return z, m, logs
+
     def forward(self, batch: dict) -> Dict[str, Optional[torch.Tensor]]:
         text_token = batch["text_token"]
         text_token_len = batch["text_token_len"]
-        feats = batch["feats"]  # Feature tensor (B, aux_channels, T_feats).
-        feats_len = batch["feats_len"]  # Feature length tensor (B,).
+        prompt_feats = batch["prompt_feats"]
+        prompt_feats_len = batch["prompt_feats_len"]
+        target_feats = batch["target_feats"]
+        target_feats_len = batch["target_feats_len"]
+        # target_audio = batch["target_audio"]
 
         # forward posterior encoder
-        z, m_q, logs_q, y_mask = self.posterior_encoder(feats, feats_lengths)
+        vae_z, vae_m, vae_logs, vae_mask = self.posterior_encoder(
+            target_feats, target_feats_len
+        )
+        prompt_z, prompt_m, prompt_logs, prompt_mask = self.posterior_encoder(
+            prompt_feats, prompt_feats_len
+        )
+        print("--- vae_z shape", vae_z.shape)
+        print("--- prompt_z shape", prompt_z.shape)
+
         # forward flow
-        z_p = self.flow(z, y_mask, g=g)  # (B, H, T_feats)
+        flow_z = self.flow(vae_z, vae_mask)  # (B, H, T_feats)
+        print("flow_z shape ", flow_z.shape)
 
         # prepare llm_target
 
         # encode text_token
-        text_token = self.text_embedding(text_token)
+        text_embed = self.text_embedding(text_token)
+        print("text embed", text_embed.shape)
+        lm_input, lm_input_len = pad_unpad_sequence(
+            text_embed,
+            text_token_len,
+            prompt_z.transpose(1, 2),
+            prompt_feats_len,
+            vae_z.transpose(1, 2),
+            target_feats_len,
+            IGNORE_ID=0,
+        )  # (B, T, C), (B, )
 
+        # run lm forward
+        print("lm input", lm_input.shape)
         outputs: BaseModelOutputWithPast = self.gpt(
-            attention_mask=model_input.attention_mask,
-            position_ids=model_input.position_ids,
-            past_key_values=model_input.past_key_values,
-            inputs_embeds=model_input.inputs_embeds,
-            use_cache=model_input.use_cache,
-            output_attentions=return_attn,
-            cache_position=model_input.cache_position,
+            inputs_embeds=lm_input, use_cache=False, output_attentions=False
         )
-        del_all(model_input)
+        print("output", outputs.last_hidden_state.shape)
+        text_logits, prompt_logits, dist_logits = split_hidden_states(
+            outputs.last_hidden_state,
+            text_token_len,
+            prompt_feats_len,
+            target_feats_len,
+        )
+        print("text_logits", text_logits.shape)
+        print("dist_logits", dist_logits.shape)
+        print("prompt_logits", prompt_logits.shape)
+        text_logits = self.text_head(text_logits)
+        print("text_logits", text_logits.shape)
+        lm_z, lm_m, lm_logs = self.dist_sampling(dist_logits)
+        plm_z, plm_m, plm_logs = self.dist_sampling(prompt_logits)  # for prompt loss
+        print("lm_z lm_m lm_logs", lm_z.shape, lm_m.shape, lm_logs.shape)
+
+        # Stop token prediction
+        stop = self.stop_proj(dist_logits)
+        stop = torch.sigmoid(stop)
 
         # get random segments
-        z_segments, z_start_idxs = get_random_segments(
-            z,
-            feats_lengths,
-            self.segment_size,
+        z_segments, start_idxs = get_random_segments(
+            vae_z,
+            target_feats_len,
+            self.config.decoder_config["segment_size"],
         )
+        """
+        sliced_target_audio = get_segments(
+            x=target_audio,
+            start_idxs=start_idxs * self.upsample_factor,
+            segment_size=self.config.decoder_config["segment_size"]
+            * self.upsample_factor,
+        )
+        """
 
         # forward decoder with random segments
-        wav = self.decoder(z_segments, g=g)
+        print(z_segments.shape)
+        gen_wav = self.decoder(z_segments)
+        print("--- gen_wav shape", gen_wav.shape)
+
+        """
+        # calculate discriminator outputs
+        p_hat = self.discriminator(gen_wav)
+        with torch.no_grad():
+            # do not store discriminator gradient in generator turn
+            p = self.discriminator(sliced_target_audio)
+        """
+        output = ModelOutput(
+            lm_m=lm_m.transpose(1, 2),
+            lm_logs=lm_logs.transpose(1, 2),
+            flow_z=flow_z,
+            vae_m=vae_m,
+            vae_logs=vae_logs,
+            vae_mask=vae_mask,
+            gen_wav=gen_wav,
+            stop_predict=stop,
+            target_feats_len=target_feats_len,
+            text_logits=text_logits,
+            text_targets=text_token,
+            prompt_m=prompt_m,
+            prompt_logs=prompt_logs,
+            plm_m=plm_m.transpose(1, 2),
+            plm_logs=plm_logs.transpose(1, 2),
+            predicted_audio=gen_wav,
+            # target_audio=sliced_target_audio,
+            z_segments=z_segments,
+            start_idxs=start_idxs,
+        )
+        return output
+        """
+        loss = self.criterion(loss_input)
+        print(loss)
+        return {"loss", loss}
+        """
 
 
-if __name__ == "__main__":
+def test():
     c = LlamaVoiceConfig()
     print(c)
     model = LlamaVoice(c)
@@ -163,5 +280,43 @@ if __name__ == "__main__":
     print("without weight norm", model.decoder)
 
     # generate test data
-    text_token = torch.randint(0, c.num_text_tokens, (2, 32))
+    batch_size = 2
+    text_token_len = torch.randint(5, 32, (batch_size,))
+    print(text_token_len)
+    text_token = torch.randint(
+        0, c.num_text_tokens, (batch_size, text_token_len.max())
+    )  # start and end is added
     print(text_token)
+    target_feats_len = torch.randint(500, 1000, (batch_size,))
+    target_feats = torch.randn(
+        batch_size, c.audio_encoder_config["aux_channels"], target_feats_len.max()
+    )
+
+    hop_size = int(np.prod(c.decoder_config["decoder_upsample_scales"]))
+    print("--- hop size", hop_size)
+    target_audio = torch.randn(batch_size, 1, target_feats_len.max() * hop_size)
+
+    prompt_feats_len = torch.randint(100, 300, (batch_size,))
+    prompt_feats = torch.randn(
+        batch_size, c.audio_encoder_config["aux_channels"], prompt_feats_len.max()
+    )
+
+    batch = {
+        "text_token": text_token,
+        "text_token_len": text_token_len,
+        "target_feats": target_feats,
+        "target_feats_len": target_feats_len,
+        "prompt_feats": prompt_feats,
+        "prompt_feats_len": prompt_feats_len,
+        "target_audio": target_audio,
+    }
+
+    for k, v in batch.items():
+        print(k, v.shape)
+
+    out = model(batch)
+    print(out)
+
+
+if __name__ == "__main__":
+    test()
